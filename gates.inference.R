@@ -35,17 +35,108 @@ pval_constrain<-function(gates,type,num.q,vcov.type){
 }
 
 
+############################################################################################################
+# gates.fun fits models to estimate both GATES and BLP
+#
+# IMPORTANT: gates.fun expects scores to be increasing with E[Y1-Y0|x]; also
+#            w=1 codes treatment and w=0 codes control. The user can control
+#            whether the modeling estimates / tests correspond to effects of 
+#            orientation E[Y0-Y1|x] instead (flips both w coding and scores).
+#
+# Arguments:
+# master = list of length >=1 containing xyz (data.frames with y,w,score,b,etc.)
+# pi = probability of w=1, as a scalar
+# num.q = number of quantiles for GATEs
+# loo = whether doing internal validation (loo=TRUE) or validation in hold-out sample (loo=FALSE)
+# effect = Defaults to "Y1-Y0"-type effects. Use "Y0-Y1" if, for example, the target is risk reduction
+# hyp.risk.cor.dir = Only applies if the inputted score is a risk score (estimate of E[Y|X]). 
+#                    This is the hypothetical direction of correlation between outcome risk and the CATE,
+#                    where the CATE scale is specified as in teh effect argument. Takes values "positive" or
+#                    "negative". For example, if the user hypothesizes that this
+#                    outcome risk is positively correlated with CATE on the "Y0-Y1" scale, set effect="Y0-Y1"
+#                    and hyp.risk.cor.dir to "positive". Set to NULL if the score is a CATE estimate.
+# blptest = Whether the user wants to test the score as a best linear predictor (BLP) of the CATE
+# gates.mod = If "chernozhukov", uses lm to estimate gates, 95% CIs, and test two hypotheses:
+#             1) whether GATEs are monotonically increasing; 2) whether first and last GATE are different.
+#             If "prop.test", GATEs estimated via simple prop.tests on disjoint strata.
+# alpha = desired type 1 error level (used for correcting p-values when loo=TRUE)
+# q.breaks = number of quantiles desired (used for GATES analysis)
+# vcov.type = type of robust standard errors (internally passed to vcovHC for use in GATEs model) 
+############################################################################################################
 
-gates.fun<-function(master,pi,num.q,loo=FALSE,irev=NULL,lintest=TRUE,unknown.pi=FALSE,
-                    alpha=0.05,q.breaks=NULL,vcov.type="HC3"){
+
+# Default ("Y1-Y0") assumes: w=1 is treatment, w=0 is control, and score is
+# an estimate of E[Y1-Y0|x] (ascending score = ascending Y1-Y0). All theta
+# estimates, CIs, BLP coefficients, and monotonicity/extreme p-values are
+# then on the Y1-Y0 scale, with quantile 1 = lowest predicted Y1-Y0.
+#
+# effect="Y0-Y1" reverses w, pi, and score consistently BEFORE any modeling
+# (an ARR-style framing when Y is an adverse outcome). Flipping all three
+# together -- rather than negating outputs after the fact -- means every
+# returned quantity comes out already and correctly oriented to E[Y0-Y1|x],
+# with quantile 1 now = lowest Y0-Y1 (i.e., the highest original score).
+# No output needs post-hoc sign-flipping under this option.
+#
+# Note: if you supply q.breaks, supply them already negated to match
+# effect="Y0-Y1", since breaks are applied to score after the flip.
+
+
+gates.fun<-function(master,
+                    pi,
+                    num.q,
+                    loo=FALSE,
+                    effect=c("Y1-Y0","Y0-Y1"),
+                    hyp.risk.cor.dir = NULL,
+                    blptest=TRUE,
+                    gates.mod=c("chernozhukov","prop.test"),
+                    alpha=0.05,
+                    q.breaks=NULL,
+                    vcov.type="HC3"){
+  
+  effect <- match.arg(effect)
+  gates.mod <- match.arg(gates.mod)
+  
+  if (is.null(pi) && (gates.mod=="chernozhukov" || blptest)) {
+    stop("pi cannot be NULL when gates.mod='chernozhukov' or blptest=TRUE")
+  }
+  
+  if (effect == "Y0-Y1") {
+    warning(
+      "gates.fun: effect='Y0-Y1' reverses w (1-w), pi (1-pi), and score (-score) ",
+      "before modeling. All returned quantities (theta, CIs, BLP coefficients, ",
+      "monotonicity/extreme p-values, and quantile membership) are on the ",
+      "E[Y0-Y1|x] scale, with quantile 1 now corresponding to the lowest Y0-Y1 ",
+      "(i.e., the highest original score). If you supply q.breaks, supply them ",
+      "already negated to match.",
+      call. = FALSE
+    )
+    master <- lapply(master, function(tt){
+      tt$w <- 1 - tt$w
+      tt$score <- -tt$score
+      tt
+    })
+    pi <- 1 - pi
+  }
+  
+  # Everything above assumes positive correlation between CATE and score
+  # If we have a risk score, we may plausibly hypothesize negative correlation.
+  # in which case we'd need to flip scoreagain.
+  if (!is.null(hyp.risk.cor.dir)) {
+    hyp.risk.cor.dir <- match.arg(hyp.risk.cor.dir, c("positive","negative"))
+    if (hyp.risk.cor.dir == "negative") {
+      master <- lapply(master, function(tt){ 
+        tt$score <- -tt$score
+        tt })
+    }
+  }
   
   if(!is.null(q.breaks)){
     if(num.q != (length(q.breaks)-1)) stop("Make sure that length(q.breaks)-1 equals num.q.")
   }
   
   thetalist<-ulist<-llist<-matrix(,length(master),num.q)
-  pval_monoton<-pval_extreme<-pval_lintest<-c()
-  pval_lintest<-rep(0,length(master))
+  pval_monoton<-pval_extreme<-pval_blptest<-rep(NA_real_,length(master))
+  blp_intercept<-blp_slope<-rep(NA_real_,length(master))
   
   bb_all<-matrix(,length(master),num.q+1)
   n0_all<-matrix(,length(master),num.q)
@@ -57,10 +148,6 @@ gates.fun<-function(master,pi,num.q,loo=FALSE,irev=NULL,lintest=TRUE,unknown.pi=
   for (i in 1:length(master)){
 
     t<-master[[i]]
-    
-    if (i %in% irev) {
-      t$score<- (t$score*-1)  #so that the lowest bins always have the people we think stand the most to gain
-    }
 
     if(length(unique(quantile(t$score,probs=seq(0,1,1/num.q))))<(num.q+1)) {
       #browser()
@@ -92,7 +179,7 @@ gates.fun<-function(master,pi,num.q,loo=FALSE,irev=NULL,lintest=TRUE,unknown.pi=
       cov.coef<-qnorm(1-alpha/2)
     }
 
-    if(!unknown.pi){
+    if(gates.mod=="chernozhukov" & !is.null(pi)){
       eis<-c()
       for(enum in 1:num.q){
         t$new.e<-ifelse(t$e==enum,1,0)*(t$w-pi)
@@ -116,7 +203,7 @@ gates.fun<-function(master,pi,num.q,loo=FALSE,irev=NULL,lintest=TRUE,unknown.pi=
       pval_monoton[i]<-pval_constrain(gates,1,num.q,vcov.type)
       pval_extreme[i]<-pval_constrain(gates,2,num.q,vcov.type)
       
-    } else {
+    } else {  # If I haven't supplied Pr(w=1), or if i just want to estimate gates via simple prop.test
       #browser()
       ptlist<-lapply(1:num.q,function(x){
         dat<-t[t$e==x,]
@@ -140,11 +227,9 @@ gates.fun<-function(master,pi,num.q,loo=FALSE,irev=NULL,lintest=TRUE,unknown.pi=
       pval_extreme[i]<-NA
       
     }
-    
-    
 
     # Also do linear test of calibration?
-    if(lintest){
+    if(blptest){
       #browser()
       newt<-t #[!(t$e %in% c(2,3)),]
       score <- newt$score
@@ -174,15 +259,16 @@ gates.fun<-function(master,pi,num.q,loo=FALSE,irev=NULL,lintest=TRUE,unknown.pi=
       
       blp.summary[, 4] <- ifelse(blp.summary[, 3] < 0, 1 - blp.summary[,4]/2, blp.summary[,4]/2)
       #browser()
-      pval_lintest[i]<-blp.summary[4,4]
-      #coef_lintest[i]<-blp.summary[4,4]
+      pval_blptest[i]<-blp.summary[4,4]
+      blp_intercept[i] <- blp.summary[3,1]
+      blp_slope[i]     <- blp.summary[4,1]
       
     }
     
     #browser()
   }
 
-  # The original vein result is predicated on having a set of p-values which are random conditional on the training set
+  # The original VEIN result is predicated on having a set of p-values which are random conditional on the training set
   # if we generate a single p-value from the LOO estimates, we have a non-random p-value
   
   #browser()
@@ -194,9 +280,9 @@ gates.fun<-function(master,pi,num.q,loo=FALSE,irev=NULL,lintest=TRUE,unknown.pi=
        "Pval Extreme" = median(pval_extreme)*(2-loo*1),
        "Theta P25" = apply(thetalist,2,quantile,probs=0.25),
        "Theta P75" = apply(thetalist,2,quantile,probs=0.75),
-       "Pval BLP test" = median(pval_lintest)*(2-loo*1),
-       "Pval BLP coef intercept"= median(blp.summary[3,1]),
-       "Pval BLP coef slope" = median(blp.summary[4,1]),
+       "BLP slope pval" = median(pval_blptest)*(2-loo*1),
+       "BLP intercept coef"= median(blp_intercept),
+       "BLP slope coef" = median(blp_slope),
        "N quantile" = table(t$e),
        "QUantile Thresholds All" = bb_all,
        "Mean prediction in quantiles" = tapply(t$score,t$e,mean),
